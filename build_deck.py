@@ -114,9 +114,11 @@ def get_top_cities(country_qcode):
     assert isinstance(country_qcode, str), "Country code must be a string representing a Wikidata Q-code."
 
     # Construct the SPARQL query
+    # TODO do we actually want max population?
     query = """
     SELECT ?city ?cityLabel (MAX(?population) as ?maxPopulation) WHERE {
-      ?city wdt:P31/wdt:P279* wd:Q515; # instance of (or subclass of) city
+      VALUES ?cityType { wd:Q515 wd:Q7930989 } # Multiple types: cities AND cities and towns
+      ?city wdt:P31/wdt:P279* ?cityType; # instance of (or subclass of) multiple types
             wdt:P17 wd:%s; # located in the administrative territorial entity of the specified country
             wdt:P1082 ?population. # with population number
       SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
