@@ -14,6 +14,7 @@ from os.path import exists
 import random
 import requests
 import json
+import time
 
 import tempfile
 import genanki
@@ -42,6 +43,7 @@ CAPITAL = CLIENT.get(EntityId('P36'))
 COORDINATES = CLIENT.get(EntityId('P625'))
 ISO2 = CLIENT.get(EntityId('P297'))
 SUPERDIVISIONS = CLIENT.get(EntityId('P131'))
+POPULATION = CLIENT.get(EntityId('P1082'))
 
 
 def try_get_time_property(entity, prop):
@@ -105,7 +107,7 @@ def try_get_wikilink_in(entity, language):
         return try_get_wikilink_in(entity, fallback)
 
 
-def get_top_cities(country_qcode):
+def get_top_cities(country_qcode, n_cities):
     # this is pretty much chatgpt's work.
     # it's a little funny for some stuff (e.g. Honolulu county #10 in US),
     # but mostly seems to work?
@@ -125,19 +127,47 @@ def get_top_cities(country_qcode):
     }
     GROUP BY ?city ?cityLabel
     ORDER BY DESC(?maxPopulation)
-    LIMIT 10
-    """ % country_qcode
+    LIMIT %s
+    """ % (
+        country_qcode,
+        # with buffer, for the duplication issue described below 
+        # (this is very conservative, though technically could
+        # result in < n_cities in the end if more than two show up with
+        # the same name)
+        2 * n_cities
+    )
 
     # URL to Wikidata Query Service
     url = "https://query.wikidata.org/sparql"
 
     # Send the query
-    response = requests.get(url, params={'query': query, 'format': 'json'})
-    data = response.json()
+    for attempts in range(5):
+        try:
+            response = requests.get(url, params={'query': query, 'format': 'json'})
+            data = response.json()
+            break
+        except:
+            logger.warning(f'Failed to get good response from Wikidata, retrying in {attempts} seconds.')
+            time.sleep(attempts)
+    else:
+        raise Exception('Failed to get good response from Wikidata.')
+
+    # Pre-processing: if there are two things with the same name, take the latter
+    # (because the first is probably a city-state containing latter)
+    unique_cities = {}
+    for item in data['results']['bindings']:
+        unique_cities[item['cityLabel']['value']] = (item, int(item['maxPopulation']['value']))
+
+    # re-sort to properly re-order with last one counting,
+    # and then chop to the right number
+    unique_cities = sorted(
+        list(unique_cities.values()),
+        key=lambda x: -1 * x[1],
+    )[:n_cities]
 
     # Process the results
     cities = []
-    for rank, item in enumerate(data['results']['bindings']):
+    for rank, (item, _) in enumerate(unique_cities):
         city_name = item['cityLabel']['value']
         population = int(item['maxPopulation']['value'])
         city_id = item['city']['value'].split('/')[-1]  # Extract the ID from the IRI
@@ -169,19 +199,40 @@ def get_subdivisions(entity, date=None):
         yield subdivision
 
 
-def get_current_superdivision(entity, date=None):
-    if date is None:
-        date = datetime.date.today()
-    
-    superdivisions = entity.getlist(SUPERDIVISIONS)
+def get_current_superdivision(entity, targets=None):
+    if targets is None:
+        return entity.get(SUPERDIVISIONS)
 
-    # TODO make this smarter. I think we need to access the statements/qualifiers
-    # of the non-super one directly, instead of loading the super identity.
-    # for now, i think [0] returns most recent superdivision (though maybe not good for multiples).
-
-    if superdivisions:
-        return superdivisions[0]
+    attempts = 0
+    current = entity
+    while attempts < 5:
+        current = current.get(SUPERDIVISIONS)
+        if current is None:
+            break
+        if current in targets:
+            return current
+        logger.debug(f'Seeking superdivision for {entity.label}: climbed to {current.label}')
+        attempts += 1
+    logger.warning(f'Could not find superdivision for {entity.label} in {attempts} attempts.')
     return None
+
+    # if date is None:
+    #     date = datetime.date.today()
+    
+    # superdivisions = entity.getlist(SUPERDIVISIONS)
+
+    # # TODO make this smarter. I think we need to access the statements/qualifiers
+    # # of the non-super one directly, instead of loading the super identity.
+    # # for now, i think [0] returns most recent superdivision (though maybe not good for multiples).
+
+    # if superdivisions:
+    #     return superdivisions[0]
+    # return None
+
+
+def get_current_population(entity):
+    population = entity.get(POPULATION)
+    return int(population.amount)
 
 
 def get_locator_map_url(entity):
@@ -360,6 +411,31 @@ REGION_CITY_MODEL = genanki.Model(
                     <p class="sub-prompt">Nearest million if >2M otherwise to the 100k</small>
                     <hr>
                     <div class="population">{{PopulationReadable}}</div>
+                    <hr>
+                    <iframe src="{{WikipediaLink}}"
+                        style="height: 100vh; width:100%;" seamless="seamless"></iframe>
+                    <a href="https://www.wikidata.org/wiki/{{WikidataId}}">
+                        Data source: Wikidata
+                    </a>
+                ''',
+        },
+        {
+            'name': 'Name to Superdivision',
+            'qfmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <p class="prompt">Located in?</p>
+                ''',
+            'afmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <p class="prompt">Located in?</p>
+                    <div class="population">{{Superdivision}}</div>
+                    <div class="value">{{CityMap}}</div>
                     <hr>
                     <iframe src="{{WikipediaLink}}"
                         style="height: 100vh; width:100%;" seamless="seamless"></iframe>
@@ -571,6 +647,7 @@ def main(argv):
     parser = argparse.ArgumentParser(description='Generate Anki geography deck from Wikidata')
     parser.add_argument('region', help="Wikidata Q-item identifier")
     parser.add_argument('--cities', default=False, action="store_true", help="Run in cities mode. TKTK")
+    parser.add_argument('--n_cities', default=10, help="How many?")
     parser.add_argument('--language', default='en', help="Language of the generated deck")
     parser.add_argument('--image-folder', default=None, help="Folder to store images, new temporary folder by default")
     parser.add_argument('--log-level', default='INFO', choices=['FATAL', 'ERROR', 'WARN', 'INFO', 'DEBUG'])
@@ -607,7 +684,7 @@ def main(argv):
 
         # if mode is cities
         if args.cities:
-            cities = get_top_cities(args.region)
+            cities = get_top_cities(args.region, int(args.n_cities))
 
             deck_name = f'Cities of {region_label}'
             deck = genanki.Deck(deck_id, deck_name)
@@ -619,6 +696,8 @@ def main(argv):
             make_map(region.get(ISO2), filename=region_file_name)
 
             media_files = [region_file_name]
+
+            target_subdivisions = list(get_subdivisions(region))
             
             # for cities, we can do this in one pass
             for city_dict in cities:
@@ -633,13 +712,13 @@ def main(argv):
                 media_files.append(file_name)
                 logger.debug(f'Building cards for {city.id}, {city_label}')
 
-                superdivision_label = None
-                superdivision = get_current_superdivision(city)
+                superdivision_label = ''
+                superdivision = get_current_superdivision(city, targets=target_subdivisions)
                 if superdivision:
                     superdivision_label = try_get_label_in(superdivision, args.language)
                     logger.debug(f'Superdivision: {superdivision.id}, {superdivision_label}')
 
-                unreadable_population = city_dict['population']
+                unreadable_population = get_current_population(city)
                 readable_population = make_legible_number(unreadable_population)
 
                 deck.add_note(
@@ -657,8 +736,8 @@ def main(argv):
                             city.id,
                             args.language,
                             try_get_wikilink_in(city, args.language),
-                            str(coordinates.latitude),
-                            str(coordinates.longitude),
+                            str(round(coordinates.latitude, 3)),
+                            str(round(coordinates.longitude, 3)),
                         ]
                     )
                 )

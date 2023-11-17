@@ -15,6 +15,7 @@ requests = "*"
 cartopy = "*"
 matplotlib = "*"
 country-bounding-boxes = "*"
+mwparserfromhell = "*"
 
 [requires]
 python_version = "3.11"
