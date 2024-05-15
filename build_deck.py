@@ -11,6 +11,10 @@ import subprocess
 import urllib.request
 import colorlog  # https://github.com/borntyping/python-colorlog
 from os.path import exists
+import random
+import requests
+import json
+import time
 
 import tempfile
 import genanki
@@ -19,6 +23,9 @@ from PIL import Image
 from wikidata.client import Client
 from wikidata.datavalue import DatavalueError
 from wikidata.entity import EntityId
+
+
+from make_map import make_map
 
 handler = colorlog.StreamHandler()
 handler.setFormatter(colorlog.ColoredFormatter('%(log_color)s[%(levelname)s] %(message)s'))
@@ -33,6 +40,10 @@ START_TIME = CLIENT.get(EntityId('P580'))
 DISSOLVED = CLIENT.get(EntityId('P576'))
 END_TIME = CLIENT.get(EntityId('P582'))
 CAPITAL = CLIENT.get(EntityId('P36'))
+COORDINATES = CLIENT.get(EntityId('P625'))
+ISO2 = CLIENT.get(EntityId('P297'))
+SUPERDIVISIONS = CLIENT.get(EntityId('P131'))
+POPULATION = CLIENT.get(EntityId('P1082'))
 
 
 def try_get_time_property(entity, prop):
@@ -96,6 +107,80 @@ def try_get_wikilink_in(entity, language):
         return try_get_wikilink_in(entity, fallback)
 
 
+def get_top_cities(country_qcode, n_cities):
+    # this is pretty much chatgpt's work.
+    # it's a little funny for some stuff (e.g. Honolulu county #10 in US),
+    # but mostly seems to work?
+
+    # Ensure 'country_qcode' is a string formatted as a Wikidata entity ID, e.g., 'Q30' for the United States.
+    assert isinstance(country_qcode, str), "Country code must be a string representing a Wikidata Q-code."
+
+    # Construct the SPARQL query
+    # TODO do we actually want max population?
+    query = """
+    SELECT ?city ?cityLabel (MAX(?population) as ?maxPopulation) WHERE {
+      VALUES ?cityType { wd:Q515 wd:Q7930989 } # Multiple types: cities AND cities and towns
+      ?city wdt:P31/wdt:P279* ?cityType; # instance of (or subclass of) multiple types
+            wdt:P17 wd:%s; # located in the administrative territorial entity of the specified country
+            wdt:P1082 ?population. # with population number
+      SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+    }
+    GROUP BY ?city ?cityLabel
+    ORDER BY DESC(?maxPopulation)
+    LIMIT %s
+    """ % (
+        country_qcode,
+        # with buffer, for the duplication issue described below 
+        # (this is very conservative, though technically could
+        # result in < n_cities in the end if more than two show up with
+        # the same name)
+        2 * n_cities
+    )
+
+    # URL to Wikidata Query Service
+    url = "https://query.wikidata.org/sparql"
+
+    # Send the query
+    for attempts in range(5):
+        try:
+            response = requests.get(url, params={'query': query, 'format': 'json'})
+            data = response.json()
+            break
+        except:
+            logger.warning(f'Failed to get good response from Wikidata, retrying in {attempts} seconds.')
+            time.sleep(attempts)
+    else:
+        raise Exception('Failed to get good response from Wikidata.')
+
+    # Pre-processing: if there are two things with the same name, take the latter
+    # (because the first is probably a city-state containing latter)
+    unique_cities = {}
+    for item in data['results']['bindings']:
+        unique_cities[item['cityLabel']['value']] = (item, int(item['maxPopulation']['value']))
+
+    # re-sort to properly re-order with last one counting,
+    # and then chop to the right number
+    unique_cities = sorted(
+        list(unique_cities.values()),
+        key=lambda x: -1 * x[1],
+    )[:n_cities]
+
+    # Process the results
+    cities = []
+    for rank, (item, _) in enumerate(unique_cities):
+        city_name = item['cityLabel']['value']
+        population = int(item['maxPopulation']['value'])
+        city_id = item['city']['value'].split('/')[-1]  # Extract the ID from the IRI
+        cities.append({
+            'city_name': city_name, 
+            'population': population, 
+            'city_id': city_id,
+            'rank': rank + 1,
+        })
+
+    return cities
+
+
 def get_subdivisions(entity, date=None):
     if date is None:
         date = datetime.date.today()
@@ -112,6 +197,42 @@ def get_subdivisions(entity, date=None):
                 or (end_time and end_time < date)):
             continue
         yield subdivision
+
+
+def get_current_superdivision(entity, targets=None):
+    if targets is None:
+        return entity.get(SUPERDIVISIONS)
+
+    attempts = 0
+    current = entity
+    while attempts < 5:
+        current = current.get(SUPERDIVISIONS)
+        if current is None:
+            break
+        if current in targets:
+            return current
+        logger.debug(f'Seeking superdivision for {entity.label}: climbed to {current.label}')
+        attempts += 1
+    logger.warning(f'Could not find superdivision for {entity.label} in {attempts} attempts.')
+    return None
+
+    # if date is None:
+    #     date = datetime.date.today()
+    
+    # superdivisions = entity.getlist(SUPERDIVISIONS)
+
+    # # TODO make this smarter. I think we need to access the statements/qualifiers
+    # # of the non-super one directly, instead of loading the super identity.
+    # # for now, i think [0] returns most recent superdivision (though maybe not good for multiples).
+
+    # if superdivisions:
+    #     return superdivisions[0]
+    # return None
+
+
+def get_current_population(entity):
+    population = entity.get(POPULATION)
+    return int(population.amount)
 
 
 def get_locator_map_url(entity):
@@ -168,6 +289,206 @@ def create_background_map(raster_maps, region_label, image_folder):
     filename = f'{image_folder}/{region_label}.png'
     background.save(filename)
     return filename
+
+
+def make_legible_number(num):
+    # little chatgpt util
+    if num >= 1000000:  # For millions
+        return f"{num/1000000:.1f}M"
+    elif num >= 1000:  # For thousands
+        return f"{num/1000:.1f}k"
+    else:  # For numbers less than 1000
+        return str(num)
+
+
+REGION_CITY_MODEL = genanki.Model(
+    2056101586,  # generated by random.randrange(1 << 30, 1 << 31)
+    'City in a Region',
+    fields=[
+        {'name': 'City'},
+        {'name': 'Region'},
+        {'name': 'Superdivision'},
+        {'name': 'Population'},
+        {'name': 'PopulationReadable'},
+        {'name': 'PopulationRank'},
+        {'name': 'CityMap'},
+        {'name': 'RegionMap'},
+        {'name': 'WikidataId'},
+        {'name': 'Language'},
+        {'name': 'WikipediaLink'},
+        {'name': 'Latitude'},
+        {'name': 'Longitude'},
+        # TODO I remain a little unclear about whether it's ok if we add fields
+        # not to the back here. i saw some weird behavior, but it's possible it went
+        # away after restart.
+    ],
+    templates=[
+        {
+            'name': 'Name from Map',
+            'qfmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">?</div>
+                    <hr>
+                    <div class="value">{{CityMap}}</div>
+                ''',
+            'afmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <div class="value">{{CityMap}}</div>
+                    <hr>
+                    <iframe src="{{WikipediaLink}}"
+                        style="height: 100vh; width:100%;" seamless="seamless"></iframe>
+                    <a href="https://www.wikidata.org/wiki/{{WikidataId}}">
+                        Data source: Wikidata
+                    </a>
+                ''',
+        },
+        {
+            'name': 'Map from Name (with canvas)',
+            'qfmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <div class="value">{{RegionMap}}</div>
+                ''',
+            'afmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <div class="value">{{CityMap}}</div>
+                    <hr>
+                    <iframe src="{{WikipediaLink}}"
+                        style="height: 100vh; width:100%;" seamless="seamless"></iframe>
+                    <a href="https://www.wikidata.org/wiki/{{WikidataId}}">
+                        Data source: Wikidata
+                    </a>
+                ''',
+        },
+        {
+            'name': 'Map from Name (without canvas)',
+            'qfmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <p class="prompt">Imagine location...</p>
+                ''',
+            'afmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <div class="value">{{CityMap}}</div>
+                    <hr>
+                    <iframe src="{{WikipediaLink}}"
+                        style="height: 100vh; width:100%;" seamless="seamless"></iframe>
+                    <a href="https://www.wikidata.org/wiki/{{WikidataId}}">
+                        Data source: Wikidata
+                    </a>
+                ''',
+        },
+        {
+            'name': 'Name to Population',
+            'qfmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <p class="prompt">Ballpark population?</p>
+                    <p class="sub-prompt">Nearest million if >2M otherwise to the 100k</small>
+                ''',
+            'afmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <p class="prompt">Ballpark population?</p>
+                    <p class="sub-prompt">Nearest million if >2M otherwise to the 100k</small>
+                    <hr>
+                    <div class="population">{{PopulationReadable}}</div>
+                    <hr>
+                    <iframe src="{{WikipediaLink}}"
+                        style="height: 100vh; width:100%;" seamless="seamless"></iframe>
+                    <a href="https://www.wikidata.org/wiki/{{WikidataId}}">
+                        Data source: Wikidata
+                    </a>
+                ''',
+        },
+        {
+            'name': 'Name to Superdivision',
+            'qfmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <p class="prompt">Located in?</p>
+                ''',
+            'afmt':
+                '''
+                    <div id="region">{{Region}}</div>
+                    <div id="city">{{City}}</div>
+                    <hr>
+                    <p class="prompt">Located in?</p>
+                    <div class="population">{{Superdivision}}</div>
+                    <div class="value">{{CityMap}}</div>
+                    <hr>
+                    <iframe src="{{WikipediaLink}}"
+                        style="height: 100vh; width:100%;" seamless="seamless"></iframe>
+                    <a href="https://www.wikidata.org/wiki/{{WikidataId}}">
+                        Data source: Wikidata
+                    </a>
+                ''',
+        },
+    ],
+    css='''
+        .card {
+            font-size: 20px;
+            text-align: center;
+        }
+        .value > img {
+            max-width: 100%;
+            height: auto;
+        }
+        #region {
+            color: gray;
+            font-size: 20px;
+        }
+        #city {
+            font-size: 24px;
+        }
+        #type {
+            color: gray;
+            font-size: 20px;
+        }
+        #capital,
+        #population {
+            font-size: 24px;
+        }
+        .prompt {
+            font-size: 24px;
+        }
+        .sub-prompt {
+            color: gray;
+            font-size: 20px;
+        }
+    ''',
+)
+
+
+class RegionCityNote(genanki.Note):
+    @property
+    def guid(self):
+        """
+        GUID for the note is calculated based on the wikidata ID of the corresponding page
+        """
+        # TODO arguably should put these at front for ultimate durability.
+        # including model id, for uniqueness between models (see: https://github.com/kerrickstaley/genanki/issues/61)
+        return genanki.guid_for(self.model.model_id, self.fields[8], self.fields[9])
 
 
 REGION_SUBDIVISION_MODEL = genanki.Model(
@@ -325,6 +646,8 @@ DECK_ID_BASE = 1290639408  # generated by random.randrange(1 << 30, 1 << 31)
 def main(argv):
     parser = argparse.ArgumentParser(description='Generate Anki geography deck from Wikidata')
     parser.add_argument('region', help="Wikidata Q-item identifier")
+    parser.add_argument('--cities', default=False, action="store_true", help="Run in cities mode. TKTK")
+    parser.add_argument('--n_cities', default=10, help="How many?")
     parser.add_argument('--language', default='en', help="Language of the generated deck")
     parser.add_argument('--image-folder', default=None, help="Folder to store images, new temporary folder by default")
     parser.add_argument('--log-level', default='INFO', choices=['FATAL', 'ERROR', 'WARN', 'INFO', 'DEBUG'])
@@ -334,7 +657,7 @@ def main(argv):
 
     region = CLIENT.get(args.region, load=True)
     region_label = try_get_label_in(region, args.language)
-    logger.info(f'Building deck for {region_label}')
+    logger.info(f'Building {"cities" if args.cities else "subdivisions"} deck for {region_label}')
 
     image_folder = args.image_folder
     if image_folder is not None:
@@ -346,61 +669,136 @@ def main(argv):
 
     with context_manager as image_folder:
         logger.debug(f'Image folder {image_folder}')
-        subdivision_maps = {}
-        for subdivision in get_subdivisions(region):
-            subdivision_label = try_get_label_in(subdivision, args.language)
-            logger.debug(f'Making map for {subdivision.id}, {subdivision_label}')
-            locator_map_url = get_locator_map_url(subdivision)
-            if locator_map_url is None:
-                continue
-            subdivision_maps[subdivision] = download_locator_map(locator_map_url, image_folder, subdivision_label)
 
-        background_map = create_background_map(
-            [raster for origin, raster in subdivision_maps.values()],
-            region_label,
-            image_folder
-        )
-
-        region_hash = hashlib.sha512(region_label.encode('utf-8')).digest()
+        # TODO consider backing this out a bit so it's not breaking old subdivisions stuff
+        # and could theoretically be merged.
+        hash_material = '--'.join([
+            args.region,
+            args.language,
+            'cities' if args.cities else 'subdivisions',
+        ])
+        region_hash = hashlib.sha512(hash_material.encode('utf-8')).digest()
         region_hashsum = np.frombuffer(region_hash, dtype=np.int32).sum()
         possible_ids = range(1 << 30, 1 << 31)
         deck_id = possible_ids[(DECK_ID_BASE + region_hashsum) % len(possible_ids)]
-        deck_name = f'Administrative Subdivisions of {region_label}'
-        deck = genanki.Deck(deck_id, deck_name)
 
-        media_files = [background_map]
+        # if mode is cities
+        if args.cities:
+            cities = get_top_cities(args.region, int(args.n_cities))
 
-        for subdivision, maps in subdivision_maps.items():
-            subdivision_label = try_get_label_in(subdivision, args.language)
-            smallest_map = min(maps, key=lambda path: os.stat(path).st_size)
-            media_files.append(smallest_map)
-            logger.debug(f'Building cards for {subdivision.id}, {subdivision_label}')
-            capital = try_get_string_property(subdivision, CAPITAL)
-            if capital is None:
-                capital_label = ""
-            else:
-                capital_label = try_get_label_in(capital, args.language)
-                logger.debug(f'Capital: {capital.id}, {capital_label}')
-            deck.add_note(
-                RegionSubdivisionNote(
-                    model=REGION_SUBDIVISION_MODEL,
-                    fields=[
-                        subdivision_label,
-                        region_label,
-                        capital_label,
-                        f'<img src="{os.path.basename(smallest_map)}">',
-                        f'<img src="{os.path.basename(background_map)}">',
-                        subdivision.id,
-                        args.language,
-                        try_get_wikilink_in(subdivision, args.language),
-                    ]
+            deck_name = f'Cities of {region_label}'
+            deck = genanki.Deck(deck_id, deck_name)
+
+            # TODO arguably this map should have all the cities passed to it somehow
+            # so it has an extent that contains all of them.
+            # otherwise, they city in question might not even be on the map if we prompt using it?
+            region_file_name = f'{image_folder}/{args.region}-for-cities.png'
+            make_map(region.get(ISO2), filename=region_file_name)
+
+            media_files = [region_file_name]
+
+            target_subdivisions = list(get_subdivisions(region))
+            
+            # for cities, we can do this in one pass
+            for city_dict in cities:
+                city = CLIENT.get(city_dict['city_id'], load=True) 
+                city_label = try_get_label_in(city, args.language)
+                logger.debug(f'Making map for {city.id}, {city_label}')
+                coordinates = city.get(COORDINATES)
+                file_name = f'{image_folder}/{args.region}-{city_dict["city_id"]}.png'
+                make_map(region.get(ISO2), coordinates.latitude, coordinates.longitude, file_name)
+
+                city_label = try_get_label_in(city, args.language)
+                media_files.append(file_name)
+                logger.debug(f'Building cards for {city.id}, {city_label}')
+
+                superdivision_label = ''
+                superdivision = get_current_superdivision(city, targets=target_subdivisions)
+                if superdivision:
+                    superdivision_label = try_get_label_in(superdivision, args.language)
+                    logger.debug(f'Superdivision: {superdivision.id}, {superdivision_label}')
+
+                unreadable_population = get_current_population(city)
+                readable_population = make_legible_number(unreadable_population)
+
+                deck.add_note(
+                    RegionCityNote(
+                        model=REGION_CITY_MODEL,
+                        fields=[
+                            city_label,
+                            region_label,
+                            superdivision_label,
+                            str(unreadable_population),
+                            str(readable_population),
+                            str(city_dict['rank']),
+                            f'<img src="{os.path.basename(file_name)}">',
+                            f'<img src="{os.path.basename(region_file_name)}">',
+                            city.id,
+                            args.language,
+                            try_get_wikilink_in(city, args.language),
+                            str(round(coordinates.latitude, 3)),
+                            str(round(coordinates.longitude, 3)),
+                        ]
+                    )
                 )
+
+        else:
+            subdivision_maps = {}
+            for subdivision in get_subdivisions(region):
+                subdivision_label = try_get_label_in(subdivision, args.language)
+                logger.debug(f'Making map for {subdivision.id}, {subdivision_label}')
+                locator_map_url = get_locator_map_url(subdivision)
+                if locator_map_url is None:
+                    continue
+                subdivision_maps[subdivision] = download_locator_map(locator_map_url, image_folder, subdivision_label)
+
+            background_map = create_background_map(
+                [raster for origin, raster in subdivision_maps.values()],
+                region_label,
+                image_folder
             )
+
+            deck_name = f'Administrative Subdivisions of {region_label}'
+            deck = genanki.Deck(deck_id, deck_name)
+    
+            media_files = [background_map]
+
+            for subdivision, maps in subdivision_maps.items():
+                subdivision_label = try_get_label_in(subdivision, args.language)
+                smallest_map = min(maps, key=lambda path: os.stat(path).st_size)
+                media_files.append(smallest_map)
+                logger.debug(f'Building cards for {subdivision.id}, {subdivision_label}')
+                capital = try_get_string_property(subdivision, CAPITAL)
+                if capital is None:
+                    capital_label = ""
+                else:
+                    capital_label = try_get_label_in(capital, args.language)
+                    logger.debug(f'Capital: {capital.id}, {capital_label}')
+                deck.add_note(
+                    RegionSubdivisionNote(
+                        model=REGION_SUBDIVISION_MODEL,
+                        fields=[
+                            subdivision_label,
+                            region_label,
+                            capital_label,
+                            f'<img src="{os.path.basename(smallest_map)}">',
+                            f'<img src="{os.path.basename(background_map)}">',
+                            subdivision.id,
+                            args.language,
+                            try_get_wikilink_in(subdivision, args.language),
+                        ]
+                    )
+                )
 
         package = genanki.Package(deck, media_files)
         package.write_to_file(deck_name + '.apkg')
-        logger.info(f'Wrote {len(subdivision_maps)} cards to "{deck_name}.apkg"')
+        logger.info(f'Wrote {len(media_files) - 1} cards to "{deck_name}.apkg"')
 
+
+# other TODOs
+# - add cities documentation
+# - make sure i haven't broken subdivisions stuff (i currently have)
+# - fully make sure it's upgradeable
 
 if __name__ == '__main__':
     import sys

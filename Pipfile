@@ -11,6 +11,11 @@ genanki = "*"
 numpy = "*"
 pillow = "*"
 colorlog = "*"
+requests = "*"
+cartopy = "*"
+matplotlib = "*"
+country-bounding-boxes = "*"
+mwparserfromhell = "*"
 
 [requires]
-python_version = "3.8"
+python_version = "3.11"
